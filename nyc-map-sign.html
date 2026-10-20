@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NYC Sign Rules Map</title>
+
+  <!-- Leaflet: free, open-source map library (no API key needed) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .panel {
+      position: absolute; z-index: 1000;
+      background: white; padding: 10px 14px; border-radius: 6px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25); font-size: 14px; line-height: 1.5;
+    }
+    #info { top: 12px; left: 56px; width: 280px; max-height: calc(100% - 260px); overflow-y: auto; }
+    #info h1 { font-size: 16px; margin: 0 0 4px; }
+    #legend { bottom: 28px; left: 12px; }
+    .swatch {
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      margin-right: 6px; vertical-align: middle; box-sizing: border-box;
+    }
+    .buttons { display: flex; gap: 8px; margin: 10px 0 6px; }
+    button {
+      font: inherit; padding: 6px 12px; border-radius: 4px; cursor: pointer;
+      border: 1px solid #2563eb; background: #2563eb; color: white;
+    }
+    button.secondary { background: white; color: #2563eb; }
+    button:disabled { opacity: .5; cursor: default; }
+    button:focus-visible { outline: 2px solid #111; outline-offset: 2px; }
+    #route-stats { margin-top: 6px; }
+    #route-zones { padding-left: 22px; margin: 6px 0 0; }
+    #route-zones li { cursor: pointer; margin-bottom: 4px; }
+    #route-zones li:hover .zone-name { text-decoration: underline; }
+    .muted { color: #666; }
+
+    /* Sign rules panel */
+    #signs { top: 12px; right: 12px; width: 300px; max-height: calc(100% - 48px); overflow-y: auto; }
+    #signs h2 { font-size: 16px; margin: 0 0 4px; }
+    #signs h3 { font-size: 14px; margin: 12px 0 4px; }
+    #signs dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 4px 0; }
+    #signs dt { color: #666; }
+    #signs dd { margin: 0; }
+    #signs ul { padding-left: 18px; margin: 4px 0; }
+    #signs a { color: #2563eb; }
+    .zone-tag {
+      display: inline-block; padding: 0 6px; border-radius: 3px; font-weight: 600;
+      border: 1px solid rgba(0,0,0,.2);
+    }
+    .square { border-radius: 2px; }
+    label.toggle { display: flex; align-items: center; gap: 6px; margin-top: 6px; cursor: pointer; }
+
+    /* Numbered zone dots on the route */
+    .zone-dot {
+      width: 22px; height: 22px; border-radius: 50%; box-sizing: border-box;
+      border: 2px solid #111; display: flex; align-items: center; justify-content: center;
+      font: 600 11px/1 system-ui, sans-serif; color: #111;
+    }
+    .zone-dot.active { outline: 3px solid #2563eb; outline-offset: 1px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="info" class="panel">
+    <h1>Sign rules along a route</h1>
+    <div class="buttons">
+      <button id="draw-btn">Draw a route</button>
+      <button id="clear-btn" class="secondary" disabled>Clear</button>
+    </div>
+    <div id="status" class="muted"></div>
+    <div id="route-stats"></div>
+    <ol id="route-zones"></ol>
+  </div>
+
+  <div id="legend" class="panel">
+    <div><span class="swatch" style="background:white;border:2px solid #111"></span>One dot per zoning district on your route</div>
+    <label class="toggle"><input type="checkbox" id="zoning-toggle" checked /> Show zoning districts</label>
+    <div id="zoning-legend">
+      <div><span class="swatch square" style="background:#f4d35e"></span>Residential (R)</div>
+      <div><span class="swatch square" style="background:#ef6f6c"></span>Commercial (C)</div>
+      <div><span class="swatch square" style="background:#a78bda"></span>Manufacturing (M)</div>
+      <div><span class="swatch square" style="background:#8fc98f"></span>Park</div>
+      <div><span class="swatch square" style="background:white;border:2px dashed #b91c1c"></span>Commercial overlay (C1, C2)</div>
+      <div class="muted">Zoom in to see districts</div>
+    </div>
+  </div>
+
+  <div id="signs" class="panel">
+    <h2>Sign rules</h2>
+    <div class="muted">Draw a route, or click anywhere on the map, to see the zoning there and what NYC allows for business signs.</div>
+  </div>
+
+  <script>
+    // ---------- Settings ----------
+    const MAX_WAYPOINTS = 25;
+    const SAMPLE_METERS = 15;          // how finely the route is checked against district boundaries
+    const MIN_RUN_METERS = 20;         // ignore districts the route only clips for a few meters
+    const ROUTER = 'https://routing.openstreetmap.de/routed-bike/route/v1/driving/';  // free OSRM bike routing
+    const ROUTE_COLOR = '#2563eb';
+    const IDLE_MESSAGE = 'Draw any shape. The route starts where you begin drawing, and gets one dot for each zoning district it passes through.';
+
+    // Zoning data: NYC Dept. of City Planning (the same data behind ZoLa)
+    const DCP = 'https://services5.arcgis.com/GfwWNkhOj9bNBqoJ/arcgis/rest/services/';
+    const ZONING_URL  = DCP + 'nyzd/FeatureServer/0/query';   // zoning districts (field: ZONEDIST)
+    const OVERLAY_URL = DCP + 'nyco/FeatureServer/0/query';   // commercial overlays (field: OVERLAY)
+    const ZONING_MIN_ZOOM = 15;
+    const DOB_SIGN_PAGE = 'https://www.nyc.gov/site/buildings/safety/installing-a-sign.page';
+
+    // ---------- Map + basemap ----------
+    const map = L.map('map').setView([40.7100, -73.9850], 14);
+
+    const esri = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
+    L.tileLayer(esri + 'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri | Zoning &copy; NYC DCP | Routing &copy; OSRM / OpenStreetMap contributors',
+      maxNativeZoom: 16, maxZoom: 19
+    }).addTo(map);
+    L.tileLayer(esri + 'World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+      maxNativeZoom: 16, maxZoom: 19
+    }).addTo(map);
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    // ====================== Sign rules (from the DOB page) ======================
+    // ---- Sign rules by district (from the DOB page) ----
+    // Each entry: what the DOB table says for that group of districts.
+    const RULES = {
+      C1C2: {
+        label: 'C1 and C2 districts',
+        perSign: '150 sq ft',
+        total: '3 × street frontage, up to 150 sq ft',
+        lighting: 'Illuminated signs allowed, up to 50 sq ft in total',
+        height: '25 ft above curb',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      C3: {
+        label: 'C3 districts',
+        perSign: '50 sq ft',
+        total: '50 sq ft',
+        lighting: 'Illuminated and flashing signs not permitted',
+        height: '25 ft above curb',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      C5: {
+        label: 'C5 districts (except C5-4)',
+        perSign: '200 sq ft',
+        total: '3 × street frontage, up to 200 sq ft',
+        lighting: 'Illuminated and flashing signs not permitted',
+        height: '25 ft above curb',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      C4C6: {
+        label: 'C4, C5-4 and C6 districts (except C6-5, C6-7)',
+        perSign: '500 sq ft',
+        total: '5 × street frontage, up to 500 sq ft',
+        lighting: 'Illuminated and flashing signs allowed within the limits above',
+        height: '40 ft above curb',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      C67: {
+        label: 'C6-5, C6-7 and C7 districts',
+        perSign: 'No limit',
+        total: 'No limit',
+        lighting: 'No limit',
+        height: 'No limit',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      C8: {
+        label: 'C8 districts (business and advertising signs)',
+        perSign: '500 sq ft if illuminated or flashing; 750 sq ft if not illuminated',
+        total: '6 × street frontage',
+        lighting: 'Illuminated and flashing signs allowed',
+        height: '40 ft if illuminated; 58 ft if not illuminated or indirectly lit',
+        zr: ['Zoning Resolution 32-60', 'https://zr.planning.nyc.gov/article-iii/chapter-2/32-60']
+      },
+      M: {
+        label: 'M1, M2 and M3 districts (business and advertising signs)',
+        perSign: '500 sq ft if illuminated or flashing; 750 sq ft if indirectly lit; 1,200 sq ft if not illuminated',
+        total: '6 × street frontage',
+        lighting: 'Illuminated and flashing signs allowed',
+        height: '40 ft if illuminated; 75 ft if not illuminated or indirectly lit (58 ft for indirectly lit signs within 500 ft of a residence or C1–C6 district)',
+        zr: ['Zoning Resolution 42-50', 'https://zr.planning.nyc.gov/article-iv/chapter-2/42-50']
+      }
+    };
+
+    // Pick the rule group for a district code like "C4-4A", "C6-5", "M1-2/R6A"
+    function ruleKey(code) {
+      if (!code) return null;
+      const c = code.toUpperCase();
+      if (c.startsWith('C1') || c.startsWith('C2')) return 'C1C2';
+      if (c.startsWith('C3')) return 'C3';
+      if (c.startsWith('C5-4')) return 'C4C6';
+      if (c.startsWith('C5')) return 'C5';
+      if (c.startsWith('C6-5') || c.startsWith('C6-7') || c.startsWith('C7')) return 'C67';
+      if (c.startsWith('C4') || c.startsWith('C6')) return 'C4C6';
+      if (c.startsWith('C8')) return 'C8';
+      if (c.startsWith('M')) return 'M';
+      return null;
+    }
+
+    function zoneColor(code) {
+      const c = (code || '').toUpperCase();
+      if (c.startsWith('R')) return '#f4d35e';
+      if (c.startsWith('C')) return '#ef6f6c';
+      if (c.startsWith('M')) return '#a78bda';
+      if (c.startsWith('PARK')) return '#8fc98f';
+      return '#cccccc';
+    }
+
+    function renderSignRules(latlng, placeName, district, overlay) {
+      const zolaLink = `https://zola.planning.nyc.gov/#17/${latlng.lat.toFixed(5)}/${latlng.lng.toFixed(5)}`;
+      const where = placeName ? escapeHtml(placeName) : 'Selected spot';
+
+      let html = `<h2>Sign rules</h2><div><b>${where}</b></div>`;
+
+      if (!district) {
+        signsEl.innerHTML = html +
+          `<p>No zoning district found here. It may be a street, the water, or outside the city.</p>`;
+        return;
+      }
+
+      html += `<dl>
+        <dt>Zoning</dt><dd><span class="zone-tag" style="background:${zoneColor(district)}">${escapeHtml(district)}</span></dd>
+        ${overlay ? `<dt>Overlay</dt><dd><span class="zone-tag" style="background:#fde2e1">${escapeHtml(overlay)}</span></dd>` : ''}
+      </dl>`;
+
+      // A C1/C2 overlay on a residential district is what allows ground-floor shops there,
+      // so the overlay's sign rules apply to those shops.
+      const governing = overlay || district;
+      const key = ruleKey(governing);
+      const d = district.toUpperCase();
+
+      if (key) {
+        const r = RULES[key];
+        html += `<h3>Business signs in ${r.label}</h3>`;
+        if (overlay) html += `<div class="muted">Shops here are allowed by the ${escapeHtml(overlay)} overlay, so its sign rules apply.</div>`;
+        html += `<dl>
+          <dt>Each sign</dt><dd>${r.perSign}</dd>
+          <dt>All signs</dt><dd>${r.total}</dd>
+          <dt>Lighting</dt><dd>${r.lighting}</dd>
+          <dt>Max height</dt><dd>${r.height}</dd>
+        </dl>`;
+        const notes = [];
+        if (d.startsWith('C6-1A')) notes.push('Flashing signs are not permitted in C6-1A.');
+        if (d.includes('/')) notes.push(`${escapeHtml(district)} is a mixed-use district, which has its own sign limits. Check the DOB page.`);
+        if (notes.length) html += `<ul>${notes.map(n => `<li>${n}</li>`).join('')}</ul>`;
+        html += `<div><a href="${r.zr[1]}" target="_blank" rel="noopener">${r.zr[0]}</a></div>`;
+      } else if (d.startsWith('R')) {
+        html += `<h3>Residential district</h3>
+          <p>Without a commercial overlay, shops generally aren’t allowed here, and signs are far more limited. The DOB page only lists limits for commercial and manufacturing districts.</p>
+          <div><a href="https://zr.planning.nyc.gov/article-ii/chapter-2/22-30" target="_blank" rel="noopener">Zoning Resolution 22-30</a></div>`;
+      } else if (d.startsWith('PARK')) {
+        html += `<h3>Park</h3><p>Parkland isn’t zoned for businesses, so business sign rules don’t apply.</p>`;
+      } else {
+        html += `<h3>Special district</h3><p>${escapeHtml(district)} has its own rules. Check ZoLa for details.</p>`;
+      }
+
+      html += `<h3>Everywhere in NYC</h3>
+        <ul>
+          <li>Wall signs of 6 sq ft or less don’t need a permit, but zoning limits still apply.</li>
+          <li>Anything over 6 sq ft needs a sign permit, plus an electrical permit if it’s wired.</li>
+          <li>Illuminated signs that stick out past the building line need a yearly permit.</li>
+          <li>Up to 3 lit, non-flashing window signs totaling 8 sq ft or less are exempt.</li>
+          <li>A licensed sign hanger can file and install signs up to 150 sq ft and 300 lb. Bigger signs need an engineer or architect.</li>
+        </ul>
+        <p class="muted">Special districts (like Times Square) and landmarks can add their own rules. This is a summary, not legal advice.</p>
+        <div><a href="${zolaLink}" target="_blank" rel="noopener">Open this spot in ZoLa</a></div>
+        <div><a href="${DOB_SIGN_PAGE}" target="_blank" rel="noopener">NYC Buildings: Installing a Sign</a></div>`;
+
+      signsEl.innerHTML = html;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    // ---------- Fetching zoning from DCP ----------
+    async function queryDCP(url, params, signal) {
+      const res = await fetch(`${url}?${new URLSearchParams(params)}`, { signal });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      return data;
+    }
+
+    // Zoning at a single point → { district, overlay }
+    async function zoningAtPoint(latlng) {
+      const p = {
+        geometry: `${latlng.lng},${latlng.lat}`, geometryType: 'esriGeometryPoint', inSR: '4326',
+        spatialRel: 'esriSpatialRelIntersects', returnGeometry: 'false', f: 'json'
+      };
+      const [z, o] = await Promise.all([
+        queryDCP(ZONING_URL, { ...p, outFields: 'ZONEDIST' }),
+        queryDCP(OVERLAY_URL, { ...p, outFields: 'OVERLAY' }).catch(() => ({ features: [] }))
+      ]);
+      return {
+        district: z.features?.[0]?.attributes.ZONEDIST,
+        overlay: o.features?.[0]?.attributes.OVERLAY
+      };
+    }
+
+    // District shapes inside a box → GeoJSON
+    function shapesInBounds(url, field, bounds, signal) {
+      return queryDCP(url, {
+        geometry: bounds.toBBoxString(), geometryType: 'esriGeometryEnvelope', inSR: '4326',
+        spatialRel: 'esriSpatialRelIntersects', outFields: `OBJECTID,${field}`, outSR: '4326',
+        resultRecordCount: '2000', f: 'geojson'
+      }, signal);
+    }
+
+    // ---------- Sign rules for a clicked spot ----------
+    const signsEl = document.getElementById('signs');
+    let lookupMarker = null, lookupId = 0, lastDrawEnd = 0;
+
+    async function showSignRulesAt(latlng) {
+      const myId = ++lookupId;
+      setActiveDot(null);
+      if (lookupMarker) map.removeLayer(lookupMarker);
+      lookupMarker = L.circleMarker(latlng, {
+        radius: 7, color: '#111', weight: 2, fillColor: '#fff', fillOpacity: 1, interactive: false
+      }).addTo(map);
+
+      signsEl.innerHTML = `<h2>Sign rules</h2><div class="muted">Looking up zoning…</div>`;
+      try {
+        const { district, overlay } = await zoningAtPoint(latlng);
+        if (myId === lookupId) renderSignRules(latlng, null, district, overlay);
+      } catch (err) {
+        console.error(err);
+        if (myId === lookupId) signsEl.innerHTML = `<h2>Sign rules</h2><div>Couldn’t load zoning for this spot. Try again, or open the browser console to see the error.</div>`;
+      }
+    }
+
+    map.on('click', e => {
+      if (drawMode || Date.now() - lastDrawEnd < 400) return;
+      showSignRulesAt(e.latlng);
+    });
+
+    // ---------- Drawing ----------
+    const drawBtn = document.getElementById('draw-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const statusEl = document.getElementById('status');
+    const statsEl = document.getElementById('route-stats');
+    const listEl = document.getElementById('route-zones');
+    const container = map.getContainer();
+
+    statusEl.textContent = IDLE_MESSAGE;
+
+    let drawMode = false, drawing = false;
+    let drawPoints = [], drawLine = null, routeLine = null, startMarker = null;
+    let zoneDots = [];   // { marker, zone }
+
+    drawBtn.addEventListener('click', () => {
+      clearRoute();
+      drawMode = true;
+      map.dragging.disable();
+      container.style.cursor = 'crosshair';
+      container.style.touchAction = 'none';
+      drawBtn.disabled = true;
+      statusEl.textContent = 'Press and drag on the map to draw your shape. Let go to finish.';
+    });
+
+    clearBtn.addEventListener('click', clearRoute);
+
+    container.addEventListener('pointerdown', e => {
+      if (!drawMode) return;
+      e.preventDefault();
+      drawing = true;
+      container.setPointerCapture(e.pointerId);
+      drawPoints = [map.mouseEventToLatLng(e)];
+      drawLine = L.polyline(drawPoints, { color: ROUTE_COLOR, weight: 3, dashArray: '6 6' }).addTo(map);
+    });
+
+    container.addEventListener('pointermove', e => {
+      if (!drawing) return;
+      const p = map.mouseEventToLatLng(e);
+      const lastPx = map.latLngToContainerPoint(drawPoints[drawPoints.length - 1]);
+      if (map.latLngToContainerPoint(p).distanceTo(lastPx) > 4) {
+        drawPoints.push(p);
+        drawLine.setLatLngs(drawPoints);
+      }
+    });
+
+    container.addEventListener('pointerup', () => {
+      if (!drawing) return;
+      drawing = false;
+      drawMode = false;
+      lastDrawEnd = Date.now();
+      map.dragging.enable();
+      container.style.cursor = '';
+      container.style.touchAction = '';
+      drawBtn.disabled = false;
+
+      if (drawPoints.length < 2) {
+        clearRoute();
+        statusEl.textContent = 'That shape was too small. Try drawing again.';
+        return;
+      }
+      buildRoute(drawPoints);
+    });
+
+    // Turn the hand-drawn line into a small number of evenly spaced waypoints
+    function pickWaypoints(points) {
+      let total = 0;
+      for (let i = 1; i < points.length; i++) total += points[i].distanceTo(points[i - 1]);
+      const spacing = Math.max(30, total / (MAX_WAYPOINTS - 2));
+
+      const kept = [points[0]];
+      for (const p of points) {
+        if (p.distanceTo(kept[kept.length - 1]) >= spacing) kept.push(p);
+      }
+      const last = points[points.length - 1];
+      if (kept[kept.length - 1] !== last) kept.push(last);
+      return kept.slice(0, MAX_WAYPOINTS);
+    }
+
+    // ---------- Routing ----------
+    async function buildRoute(points) {
+      clearBtn.disabled = false;
+      statusEl.textContent = 'Finding a route along your shape…';
+
+      const coords = pickWaypoints(points).map(p => `${p.lng.toFixed(5)},${p.lat.toFixed(5)}`).join(';');
+
+      let route, line;
+      try {
+        const res = await fetch(`${ROUTER}${coords}?overview=full&geometries=geojson`);
+        const data = await res.json();
+        if (data.code !== 'Ok') throw new Error(data.message || data.code);
+        route = data.routes[0];
+        line = route.geometry.coordinates.map(([lng, lat]) => L.latLng(lat, lng));
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Couldn’t build a route. Try a simpler shape, or check the browser console.';
+        return;
+      }
+
+      drawLine.setStyle({ opacity: 0.35 });   // keep the sketch faintly visible for comparison
+      routeLine = L.polyline(line, { color: ROUTE_COLOR, weight: 5, opacity: 0.85 }).addTo(map);
+      startMarker = L.circleMarker(line[0], {
+        radius: 6, color: '#111', weight: 3, fillColor: '#fff', fillOpacity: 1, interactive: false
+      }).bindTooltip('Start', { permanent: true, direction: 'left', offset: [-8, 0] }).addTo(map);
+      map.fitBounds(routeLine.getBounds(), { padding: [40, 40] });
+
+      const miles = (route.distance / 1609.34).toFixed(1);
+      statusEl.textContent = 'Checking zoning along the route…';
+
+      try {
+        const zones = await zonesAlongRoute(line);
+        drawZoneDots(zones);
+        statusEl.textContent = 'Click a dot or a list item to see its sign rules.';
+        statsEl.innerHTML = `${miles} mi route<br>${zones.length} zoning districts along the way`;
+        if (zones.length) showZone(zones[0], zoneDots[0].marker);
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'The route is ready, but zoning couldn’t be loaded. Check the browser console.';
+        statsEl.textContent = `${miles} mi route`;
+      }
+    }
+
+    // ---------- One dot per zoning district along the route ----------
+    async function zonesAlongRoute(line) {
+      const bounds = L.latLngBounds(line).pad(0.05);
+      const [zoneGeo, overlayGeo] = await Promise.all([
+        shapesInBounds(ZONING_URL, 'ZONEDIST', bounds),
+        shapesInBounds(OVERLAY_URL, 'OVERLAY', bounds).catch(() => ({ features: [] }))
+      ]);
+      const districts = zoneGeo.features || [];
+      const overlays = overlayGeo.features || [];
+
+      // Walk the route in small steps and note which district each step is in
+      const samples = resample(line, SAMPLE_METERS);
+      const runs = [];   // consecutive stretches inside the same district polygon
+      samples.forEach(pt => {
+        const f = districts.find(d => inFeature(pt, d));
+        const id = f ? f.properties.OBJECTID ?? f.id : null;
+        const last = runs[runs.length - 1];
+        if (last && last.id === id) last.points.push(pt);
+        else runs.push({ id, feature: f, points: [pt] });
+      });
+
+      // Keep the first real stretch through each district polygon
+      const seen = new Set(), zones = [];
+      runs.forEach(run => {
+        if (run.id == null || seen.has(run.id)) return;
+        if ((run.points.length - 1) * SAMPLE_METERS < MIN_RUN_METERS && runs.length > 1) return;
+        seen.add(run.id);
+        const mid = run.points[Math.floor(run.points.length / 2)];
+        const ov = overlays.find(o => inFeature(mid, o));
+        zones.push({
+          latlng: mid,
+          district: run.feature.properties.ZONEDIST,
+          overlay: ov ? ov.properties.OVERLAY : null
+        });
+      });
+      return zones;
+    }
+
+    // Points every `step` meters along a polyline
+    function resample(line, step) {
+      const out = [line[0]];
+      let carry = 0;
+      for (let i = 1; i < line.length; i++) {
+        const a = line[i - 1], b = line[i];
+        const seg = a.distanceTo(b);
+        let t = step - carry;
+        while (t <= seg) {
+          const f = t / seg;
+          out.push(L.latLng(a.lat + (b.lat - a.lat) * f, a.lng + (b.lng - a.lng) * f));
+          t += step;
+        }
+        carry = seg - (t - step);
+      }
+      out.push(line[line.length - 1]);
+      return out;
+    }
+
+    // Point-in-polygon for GeoJSON Polygon / MultiPolygon (handles holes)
+    function inFeature(pt, feature) {
+      const g = feature.geometry;
+      if (!g) return false;
+      const polys = g.type === 'Polygon' ? [g.coordinates] : g.type === 'MultiPolygon' ? g.coordinates : [];
+      return polys.some(rings => {
+        if (!inRing(pt, rings[0])) return false;
+        for (let i = 1; i < rings.length; i++) if (inRing(pt, rings[i])) return false;
+        return true;
+      });
+    }
+
+    function inRing(pt, ring) {
+      const x = pt.lng, y = pt.lat;
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i], [xj, yj] = ring[j];
+        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    }
+
+    function drawZoneDots(zones) {
+      listEl.innerHTML = '';
+      zones.forEach((zone, i) => {
+        const governing = zone.overlay || zone.district;
+        const icon = L.divIcon({
+          className: '',
+          html: `<div class="zone-dot" style="background:${zoneColor(governing)}">${i + 1}</div>`,
+          iconSize: [22, 22], iconAnchor: [11, 11]
+        });
+        const label = zone.overlay ? `${zone.overlay} on ${zone.district}` : zone.district;
+        const marker = L.marker(zone.latlng, { icon, title: label, keyboard: true, bubblingMouseEvents: false })
+          .on('click', () => showZone(zone, marker))
+          .addTo(map);
+        zoneDots.push({ marker, zone });
+
+        const key = ruleKey(governing);
+        const summary = key ? `${RULES[key].perSign} per sign` :
+          zone.district.toUpperCase().startsWith('R') ? 'Residential, very limited signs' :
+          zone.district.toUpperCase().startsWith('PARK') ? 'Park, no business signs' : 'Special rules';
+
+        const li = document.createElement('li');
+        li.innerHTML = `<span class="zone-name"><b>${escapeHtml(label)}</b></span><br><span class="muted">${escapeHtml(summary)}</span>`;
+        li.addEventListener('click', () => {
+          map.setView(zone.latlng, Math.max(map.getZoom(), 16));
+          showZone(zone, marker);
+        });
+        listEl.appendChild(li);
+      });
+    }
+
+    function showZone(zone, marker) {
+      lookupId++;   // cancel any pending click lookup
+      if (lookupMarker) { map.removeLayer(lookupMarker); lookupMarker = null; }
+      setActiveDot(marker);
+      const idx = zoneDots.findIndex(d => d.marker === marker);
+      renderSignRules(zone.latlng, `Stop ${idx + 1} on your route`, zone.district, zone.overlay);
+    }
+
+    function setActiveDot(marker) {
+      zoneDots.forEach(d => d.marker.getElement()?.firstChild?.classList.toggle('active', d.marker === marker));
+    }
+
+    // ---------- Reset ----------
+    function clearRoute() {
+      [drawLine, routeLine, startMarker, lookupMarker].forEach(l => { if (l) map.removeLayer(l); });
+      drawLine = routeLine = startMarker = lookupMarker = null;
+      zoneDots.forEach(d => map.removeLayer(d.marker));
+      zoneDots = [];
+      statsEl.innerHTML = '';
+      listEl.innerHTML = '';
+      clearBtn.disabled = true;
+      statusEl.textContent = IDLE_MESSAGE;
+    }
+
+    // ---------- Zoning district shapes on the map ----------
+    map.createPane('zoning');
+    map.getPane('zoning').style.zIndex = 350;   // below the route and dots
+    const zoningRenderer = L.svg({ pane: 'zoning' });
+
+    const zoningLayer = L.geoJSON(null, {
+      pane: 'zoning', renderer: zoningRenderer, interactive: false,
+      style: f => ({ color: zoneColor(f.properties.ZONEDIST), weight: 1, opacity: 0.6,
+                     fillColor: zoneColor(f.properties.ZONEDIST), fillOpacity: 0.22 })
+    }).addTo(map);
+    const overlayLayer = L.geoJSON(null, {
+      pane: 'zoning', renderer: zoningRenderer, interactive: false,
+      style: () => ({ color: '#b91c1c', weight: 1.5, dashArray: '4 3', fill: false })
+    }).addTo(map);
+
+    const zoningToggle = document.getElementById('zoning-toggle');
+    let zoningAbort = null, zoningTimer = null;
+
+    async function loadZoningShapes() {
+      if (zoningAbort) zoningAbort.abort();
+      zoningLayer.clearLayers();
+      overlayLayer.clearLayers();
+      if (!zoningToggle.checked || map.getZoom() < ZONING_MIN_ZOOM) return;
+
+      zoningAbort = new AbortController();
+      const bounds = map.getBounds().pad(0.2);
+      try {
+        const [zones, overlays] = await Promise.all([
+          shapesInBounds(ZONING_URL, 'ZONEDIST', bounds, zoningAbort.signal),
+          shapesInBounds(OVERLAY_URL, 'OVERLAY', bounds, zoningAbort.signal).catch(() => null)
+        ]);
+        zoningLayer.addData(zones);
+        if (overlays) overlayLayer.addData(overlays);
+      } catch (err) {
+        if (err.name !== 'AbortError') console.error(err);
+      }
+    }
+
+    map.on('moveend', () => { clearTimeout(zoningTimer); zoningTimer = setTimeout(loadZoningShapes, 300); });
+    zoningToggle.addEventListener('change', () => {
+      document.getElementById('zoning-legend').style.display = zoningToggle.checked ? '' : 'none';
+      loadZoningShapes();
+    });
+    loadZoningShapes();
+  </script>
+</body>
+</html>
